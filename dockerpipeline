@@ -1,0 +1,118 @@
+def COLOR_MAP = [
+    'SUCCESS': 'good',
+    'FAILURE': 'danger',
+]
+
+pipeline {
+    agent any
+
+    environment {
+        JAVA_HOME   = "/usr/lib/jvm/java-17-openjdk-amd64"
+        MAVEN_HOME  = "/var/lib/jenkins/tools/hudson.tasks.Maven_MavenInstallation/MAVEN3.9"
+        PATH        = "${JAVA_HOME}/bin:${MAVEN_HOME}/bin:${env.PATH}"
+        registryCredential = 'ecr:us-east-1:awscreds'
+        appRegistry = "440491339282.dkr.ecr.us-east-1.amazonaws.com/vprofileappimg"
+        vprofileRegistry = "440491339282.dkr.ecr.us-east-1.amazonaws.com"
+    }
+
+    stages {
+        stage('Fetch code') {
+            steps {
+                git branch: 'docker', url: 'https://github.com/hkhcoder/vprofile-project.git'
+            }
+        }
+
+        stage('Verify Java & Maven') {
+            steps {
+                sh '''
+                    echo JAVA_HOME: $JAVA_HOME
+                    echo MAVEN_HOME: $MAVEN_HOME
+                    java -version
+                    mvn -version
+                '''
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'mvn install -DskipTests'
+            }
+            post {
+                success {
+                    echo 'Build completed successfully!'
+                    archiveArtifacts artifacts: '**/*.war', fingerprint: true
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh 'mvn test'
+            }
+        }
+
+        stage('Checkstyle Tests') {
+            steps {
+                sh 'mvn checkstyle:checkstyle'
+            }
+        }
+
+        stage("Sonar Code Analysis") {
+            environment {
+                scannerHome = tool 'sonar6.2'
+            }
+            steps {
+                withSonarQubeEnv('sonarserver') {
+                    sh '''${scannerHome}/bin/sonar-scanner \
+                        -Dsonar.projectKey=vprofile \
+                        -Dsonar.projectName=vprofile \
+                        -Dsonar.projectVersion=1.0 \
+                        -Dsonar.sources=src/ \
+                        -Dsonar.java.binaries=target/test-classes/com/visualpathit/account/controllerTest/ \
+                        -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                        -Dsonar.jacoco.reportsPath=target/jacoco.exec \
+                        -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml'''
+                }
+            }
+        }
+
+        stage("Quality Gate") {
+            steps {
+                timeout(time: 1, unit: 'HOURS') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build App Image') {
+            steps {
+                script {
+                    def dockerImage = docker.build("${appRegistry}:${env.BUILD_NUMBER}", "./Docker-files/app/multistage/")
+                    // Save dockerImage to env for later use
+                    env.DOCKER_IMAGE = "${appRegistry}:${env.BUILD_NUMBER}"
+                }
+            }
+        }
+
+        stage('Upload App Image') {
+            steps {
+                script {
+                    def dockerImage = docker.image(env.DOCKER_IMAGE)
+                    docker.withRegistry(vprofileRegistry, registryCredential) {
+                        dockerImage.push("${env.BUILD_NUMBER}")
+                        dockerImage.push('latest')
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'Slack Notifications.'
+            slackSend channel: '#all-subhasish',
+                color: COLOR_MAP[currentBuild.currentResult],
+                message: "*${currentBuild.currentResult}:* Job ${env.JOB_NAME} build ${env.BUILD_NUMBER}\nMore info at: ${env.BUILD_URL}"
+        }
+    }
+}
